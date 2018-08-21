@@ -12,14 +12,12 @@
 #include <sys/types.h>
 #include <stdio.h>
 #include <string.h>
-#include <libswresample/swresample.h>
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libswscale/swscale.h>
 #include <libavutil/mathematics.h>
 #include <libavutil/opt.h>
 #include <libavutil/old_pix_fmts.h>
-#include <libswresample/swresample.h>
 #include <libavfilter/avfiltergraph.h>
 #include <libavfilter/avcodec.h>
 #include <libavfilter/buffersink.h>
@@ -49,27 +47,19 @@ typedef struct {
     ngx_pool_t *pool;
 } video_buffer;
 
-static AVFormatContext *ifmt_ctx;
-static AVFormatContext *ofmt_ctx;
-static AVInputFormat *infmt;
-static AVIOContext *io_read_context;
-// ngx_chain_t -> buffer memory
-static u_char *chain_memory;
-static unsigned char *exchange_area_write;
-static unsigned char *exchange_area_read;
-
 typedef struct FilteringContext {
     AVFilterContext *buffersink_ctx;
     AVFilterContext *buffersrc_ctx;
     AVFilterGraph *filter_graph;
 } FilteringContext;
-static FilteringContext *filter_ctx;
 
-u_char *flatten_chain(ngx_chain_t *out, ngx_pool_t *pool) {
+uint64_t flatten_chain(ngx_chain_t *out, ngx_pool_t *pool, u_char **buf) {
     off_t bsize;
     ngx_chain_t *out_ptr;
     u_char *ret_ptr;
     uint64_t flattenSize = 0;
+    //    u_char *temp;
+
     out_ptr = out;
     while (out_ptr) {
         if (!out_ptr->buf->in_file) {
@@ -78,8 +68,8 @@ u_char *flatten_chain(ngx_chain_t *out, ngx_pool_t *pool) {
         }
         out_ptr = out_ptr->next;
     }
-    chain_memory = ngx_pcalloc(pool, flattenSize);
-    ret_ptr = chain_memory;
+    *buf = ngx_palloc(pool, flattenSize);
+    ret_ptr = *buf;
     out_ptr = out;
     while (out_ptr) {
         bsize = ngx_buf_size(out_ptr->buf);
@@ -89,25 +79,7 @@ u_char *flatten_chain(ngx_chain_t *out, ngx_pool_t *pool) {
         }
         out_ptr = out_ptr->next;
     }
-    av_log(NULL, AV_LOG_INFO, "flatten size: %"PRIu64"\n", flattenSize);
-    return (chain_memory);
-}
-
-int get_chain_memory_size(ngx_chain_t *chain) {
-    uint64_t size = 0;
-    off_t bsize;
-    ngx_chain_t *out_ptr;
-    out_ptr = chain;
-    while (out_ptr) {
-        if (!out_ptr->buf->in_file) {
-            bsize = ngx_buf_size(out_ptr->buf);
-            size += bsize;
-        }
-        out_ptr = out_ptr->next;
-    }
-    av_log(NULL, AV_LOG_INFO, "chain size: %"PRIu64"\n", size);
-
-    return size;
+    return flattenSize;
 }
 
 /* read callback function for IOContext*/
@@ -123,29 +95,27 @@ static int read_packet(void *opaque, uint8_t *buf, int buf_size) {
 }
 
 static int open_input_file(ngx_pool_t *pool, ngx_chain_t *chain, int width,
-        int height) { /* Reserve height for future */
+        int height, AVFormatContext *ifmt_ctx, AVIOContext **io_read_context) { /* Reserve height for future */
     int ret;
     unsigned int i;
-    //    buffer_data bd = {.ptr = NULL, .size = 0};
+    /* move input format to local scope*/
+    AVInputFormat *infmt;
     video_buffer *source;
     AVDictionary *vdec_opt = NULL;
-    size_t chain_size = get_chain_memory_size(chain);
-    if (chain_size == 0) return -1;
+    unsigned char *exchange_area_read = NULL;
+    u_char *buf = NULL;
     source = ngx_pcalloc(pool, sizeof (video_buffer));
     source->data = NULL;
     source->len = 0;
     source->pool = pool;
-    av_log(NULL, AV_LOG_ERROR, "buffer size %lu\n", chain_size);
     size_t _size = 4096;
-    exchange_area_read = av_mallocz(_size);
-    u_char* buf = ngx_pcalloc(pool, chain_size);
-    ngx_memcpy(buf, flatten_chain(chain, pool), chain_size);
+    exchange_area_read = (unsigned char *) av_mallocz(_size * sizeof(unsigned char));
+    size_t chain_size = flatten_chain(chain, pool, &buf);
     source->data = buf;
     source->len = chain_size;
-    io_read_context = avio_alloc_context(exchange_area_read, _size, 0, (void *) source, read_packet, NULL, NULL);
-    ifmt_ctx = avformat_alloc_context();
+    *io_read_context = avio_alloc_context(exchange_area_read, _size, 0, (void *) source, read_packet, NULL, NULL);
     infmt = av_find_input_format("mpegts");
-    ifmt_ctx->pb = io_read_context;
+    ifmt_ctx->pb = *io_read_context;
     if ((ret = avformat_open_input(&ifmt_ctx, "filename.ts", infmt, NULL)) < 0) {
         av_log(NULL, AV_LOG_ERROR, "Cannot open input file\n");
         return ret;
@@ -155,9 +125,8 @@ static int open_input_file(ngx_pool_t *pool, ngx_chain_t *chain, int width,
         av_log(NULL, AV_LOG_ERROR, "Cannot find stream information\n");
         return ret;
     }
-    
+
     int dec_ = 0;
-    
     for (i = 0; i < ifmt_ctx->nb_streams; i++) {
         AVStream *stream;
         AVCodecContext *codec_ctx;
@@ -179,7 +148,7 @@ static int open_input_file(ngx_pool_t *pool, ngx_chain_t *chain, int width,
                 av_log(NULL, AV_LOG_ERROR, "Failed to open decoder for stream #%u\n", i);
                 return ret;
             }
-            
+
             if (codec_ctx->codec_type == AVMEDIA_TYPE_VIDEO && dec_ == 0) {
                 /* setting to test if it gains any performance hit*/
                 if (codec_ctx->codec->capabilities & CODEC_CAP_TRUNCATED)
@@ -195,6 +164,12 @@ static int open_input_file(ngx_pool_t *pool, ngx_chain_t *chain, int width,
         av_dict_free(&vdec_opt);
     }
     av_dump_format(ifmt_ctx, 0, "filename", 0);
+    /*
+    if (io_read_context->buffer) av_freep(&io_read_context->buffer);
+    if (io_read_context) av_freep(&io_read_context);
+     */
+    //if (buf) ngx_pfree(pool, buf);
+    if (source) ngx_pfree(pool, source);
     return 0;
 }
 
@@ -212,23 +187,23 @@ static int write_adbr_packet(void *opaque, unsigned char *buf, int buf_size) {
 }
 
 static int prepare_output_encoder(ngx_http_request_t *req, video_buffer *destination,
-        AVFormatContext *ifmt_ctx, int width, int height) {
+        AVFormatContext *ifmt_ctx, AVFormatContext *ofmt_ctx, int width, int height,
+        AVIOContext **io_context) {
     AVStream *out_stream;
     AVStream *in_stream;
     AVCodecContext *dec_ctx, *enc_ctx;
     AVCodec *encoder;
-    AVIOContext *io_context;
+    //    AVIOContext *io_context;
     int ret;
     unsigned int i;
     int buffer_size;
-    ofmt_ctx = NULL;
     AVDictionary *option = NULL;
     AVDictionary *format_option = NULL;
-    ofmt_ctx = avformat_alloc_context();
+    unsigned char *exchange_area_write;
     buffer_size = 1024;
-    exchange_area_write = ngx_pcalloc(req->pool, buffer_size * sizeof (unsigned char));
-    io_context = avio_alloc_context(exchange_area_write, buffer_size, 1, (void *) destination, NULL, write_adbr_packet, NULL);
-    ofmt_ctx->pb = io_context;
+    exchange_area_write = (unsigned char *) av_mallocz(buffer_size * sizeof (unsigned char));
+    *io_context = avio_alloc_context(exchange_area_write, buffer_size, 1, (void *) destination, NULL, write_adbr_packet, NULL);
+    ofmt_ctx->pb = *io_context;
     ofmt_ctx->oformat = av_guess_format("mpegts", NULL, NULL);
     if (!ofmt_ctx) {
         av_log(NULL, AV_LOG_ERROR, "Could not create output context\n");
@@ -287,9 +262,9 @@ static int prepare_output_encoder(ngx_http_request_t *req, video_buffer *destina
             enc_ctx->me_cmp = 1;
             enc_ctx->me_range = 16;
             enc_ctx->scenechange_threshold = 0;
-//            if ((LIBAVCODEC_VERSION_MAJOR <= 56) || !(LIBAVCODEC_VERSION_MINOR <= 8)) {
-//                enc_ctx->me_method = ME_ITER;
-//            }
+            //            if ((LIBAVCODEC_VERSION_MAJOR <= 56) || !(LIBAVCODEC_VERSION_MINOR <= 8)) {
+            //                enc_ctx->me_method = ME_ITER;
+            //            }
             enc_ctx->me_subpel_quality = 4;
             enc_ctx->i_quant_factor = 1;
             enc_ctx->qcompress = 0;
@@ -334,6 +309,7 @@ static int prepare_output_encoder(ngx_http_request_t *req, video_buffer *destina
         av_log(NULL, AV_LOG_ERROR, "Error occurred when opening output file\n");
         return ret;
     }
+    printf("Prepare output encoder ok\n");
     return 0;
 }
 
@@ -486,17 +462,19 @@ static int init_filter(FilteringContext* fctx, AVCodecContext *dec_ctx,
 end:
     avfilter_inout_free(&inputs);
     avfilter_inout_free(&outputs);
-
+    /*
+    printf("filter video ok\n");
+    */
     return ret;
 }
 
-static int init_filters(int width, int height) {
+static int init_filters(int width, int height, AVFormatContext *ifmt_ctx, AVFormatContext *ofmt_ctx, FilteringContext *filter_ctx) {
 
     //    const char *filter_spec;
     char filter_spec[512];
     unsigned int i;
     int ret;
-    filter_ctx = av_malloc_array(ifmt_ctx->nb_streams, sizeof (*filter_ctx));
+    //    filter_ctx = av_malloc_array(ifmt_ctx->nb_streams, sizeof (*filter_ctx));
     if (!filter_ctx)
         return AVERROR(ENOMEM);
 
@@ -519,10 +497,11 @@ static int init_filters(int width, int height) {
                 return ret;
         }
     }
+    printf("init filter ok\n");
     return 0;
 }
 
-static int encode_write_frame(AVFrame *filt_frame, unsigned int stream_index, int *got_frame) {
+static int encode_write_frame(AVFrame *filt_frame, unsigned int stream_index, int *got_frame, AVFormatContext *ifmt_ctx, AVFormatContext *ofmt_ctx) {
     int ret;
     int got_frame_local;
     AVPacket enc_pkt;
@@ -539,7 +518,7 @@ static int encode_write_frame(AVFrame *filt_frame, unsigned int stream_index, in
     enc_pkt.data = NULL;
     enc_pkt.size = 0;
     av_init_packet(&enc_pkt);
-    
+
     ret = enc_func(ofmt_ctx->streams[stream_index]->codec, &enc_pkt,
             filt_frame, got_frame);
     av_frame_free(&filt_frame);
@@ -547,23 +526,26 @@ static int encode_write_frame(AVFrame *filt_frame, unsigned int stream_index, in
         return ret;
     if (!(*got_frame))
         return 0;
-    
+
     /* prepare packet for muxing
      * the most important thing when muxing mpegts stream is:
      * never change or optimize timestamp
      */
     enc_pkt.stream_index = stream_index;
-    //    if (enc_pkt.pts != AV_NOPTS_VALUE) {
-    //        av_packet_rescale_ts(&enc_pkt,
-    //                ifmt_ctx->streams[stream_index]->time_base,
-    //                ofmt_ctx->streams[stream_index]->time_base);
-    //    }
+    /*
+    if (enc_pkt.pts != AV_NOPTS_VALUE) {
+        av_packet_rescale_ts(&enc_pkt,
+                ifmt_ctx->streams[stream_index]->time_base,
+                ofmt_ctx->streams[stream_index]->time_base);
+    }
+     */
     /* mux encoded frame */
     ret = av_interleaved_write_frame(ofmt_ctx, &enc_pkt);
     return ret;
 }
 
-static int filter_encode_write_frame(AVFrame *frame, unsigned int stream_index) {
+static int filter_encode_write_frame(AVFrame *frame, unsigned int stream_index,
+        AVFormatContext *ifmt_ctx, AVFormatContext *ofmt_ctx, FilteringContext *filter_ctx) {
     int ret;
     AVFrame *filt_frame;
     //av_log(NULL, AV_LOG_INFO, "Pushing decoded frame to filters\n");
@@ -574,7 +556,6 @@ static int filter_encode_write_frame(AVFrame *frame, unsigned int stream_index) 
         av_log(NULL, AV_LOG_ERROR, "Error while feeding the filtergraph\n");
         return ret;
     }
-
     /* pull filtered frames from the filtergraph */
     while (1) {
         filt_frame = av_frame_alloc();
@@ -596,7 +577,7 @@ static int filter_encode_write_frame(AVFrame *frame, unsigned int stream_index) 
             break;
         }
         filt_frame->pict_type = AV_PICTURE_TYPE_NONE;
-        ret = encode_write_frame(filt_frame, stream_index, NULL);
+        ret = encode_write_frame(filt_frame, stream_index, NULL, ifmt_ctx, ofmt_ctx);
         if (ret < 0)
             break;
     }
@@ -604,7 +585,7 @@ static int filter_encode_write_frame(AVFrame *frame, unsigned int stream_index) 
     return ret;
 }
 
-static int flush_encoder(unsigned int stream_index) {
+static int flush_encoder(unsigned int stream_index, AVFormatContext *ifmt_ctx, AVFormatContext *ofmt_ctx) {
     int ret;
     int got_frame;
 
@@ -614,7 +595,7 @@ static int flush_encoder(unsigned int stream_index) {
 
     while (1) {
         //av_log(NULL, AV_LOG_INFO, "Flushing stream #%u encoder\n", stream_index);
-        ret = encode_write_frame(NULL, stream_index, &got_frame);
+        ret = encode_write_frame(NULL, stream_index, &got_frame, ifmt_ctx, ofmt_ctx);
         if (ret < 0)
             break;
         if (!got_frame)
@@ -623,16 +604,16 @@ static int flush_encoder(unsigned int stream_index) {
     return ret;
 }
 
-static int flush_decoder(unsigned int stream_index) {
+static int flush_decoder(unsigned int stream_index, AVFormatContext *ifmt_ctx) {
     int ret;
     int got_frame;
     AVFrame *frame = NULL;
     AVPacket packet = {.data = NULL, .size = 0};
-
-    //    if (!(ofmt_ctx->streams[stream_index]->codec->codec->capabilities &
-    //            CODEC_CAP_DELAY))
-    //        return 0;
-
+    /*
+        if (!(ofmt_ctx->streams[stream_index]->codec->codec->capabilities &
+                CODEC_CAP_DELAY))
+            return 0;
+     */
     while (1) {
         frame = av_frame_alloc();
         ret = avcodec_decode_video2(ifmt_ctx->streams[stream_index]->codec, frame,
@@ -647,13 +628,17 @@ static int flush_decoder(unsigned int stream_index) {
     return ret;
 }
 
-//int ngx_estreaming_adaptive_bitrate(ngx_pool_t *pool, u_char *source, video_buffer *destination) {
-
 int ngx_estreaming_adaptive_bitrate(ngx_http_request_t *req, ngx_chain_t *chain,
         video_buffer *destination, mp4_split_options_t *options) {
-    int ret;
+    int ret = 0;
     AVPacket packet = {.data = NULL, .size = 0};
     AVFrame *frame = NULL;
+    /* move global var into local scope */
+    AVFormatContext *ifmt_ctx = NULL;
+    AVFormatContext *ofmt_ctx = NULL;
+    FilteringContext *filter_ctx = NULL;
+    AVIOContext *io_read_context = NULL;
+    AVIOContext *io_write_context = NULL;
     enum AVMediaType type;
     unsigned int stream_index;
     unsigned int i;
@@ -662,9 +647,6 @@ int ngx_estreaming_adaptive_bitrate(ngx_http_request_t *req, ngx_chain_t *chain,
     int height = 360;
     int width = 640;
     int (*dec_func)(AVCodecContext *, AVFrame *, int *, const AVPacket *);
-    av_log_set_level(AV_LOG_ERROR);
-    av_register_all();
-    avfilter_register_all();
     // setup video resolution
     if (options->video_resolution == 3) {
         // 720p
@@ -675,15 +657,19 @@ int ngx_estreaming_adaptive_bitrate(ngx_http_request_t *req, ngx_chain_t *chain,
         width = 854;
         height = 480;
     }
-
-    if ((ret = open_input_file(req->pool, chain, width, height)) < 0) {
-        avformat_close_input(&ifmt_ctx);
-        return -1;
+    /* allocate memory for input format context*/
+    ifmt_ctx = avformat_alloc_context();
+    if ((ret = open_input_file(req->pool, chain, width,
+            height, ifmt_ctx, &io_read_context)) < 0) {
+        goto end;
     }
 
-    if ((ret = prepare_output_encoder(req, destination, ifmt_ctx, width, height)) < 0)
+    /* allocate memory for output context */
+    ofmt_ctx = avformat_alloc_context();
+    if ((ret = prepare_output_encoder(req, destination, ifmt_ctx, ofmt_ctx, width, height, &io_write_context)) < 0)
         goto end;
-    if ((ret = init_filters(width, height)) < 0)
+    filter_ctx = av_malloc_array(ifmt_ctx->nb_streams, sizeof (*filter_ctx));
+    if ((ret = init_filters(width, height, ifmt_ctx, ofmt_ctx, filter_ctx)) < 0)
         goto end;
     /* read all packets */
     while (1) {
@@ -710,7 +696,7 @@ int ngx_estreaming_adaptive_bitrate(ngx_http_request_t *req, ngx_chain_t *chain,
                 }
                 if (got_frame) {
                     frame->pts = av_frame_get_best_effort_timestamp(frame);
-                    ret = filter_encode_write_frame(frame, stream_index);
+                    ret = filter_encode_write_frame(frame, stream_index, ifmt_ctx, ofmt_ctx, filter_ctx);
                     av_frame_free(&frame);
                     if (ret < 0)
                         goto end;
@@ -719,7 +705,7 @@ int ngx_estreaming_adaptive_bitrate(ngx_http_request_t *req, ngx_chain_t *chain,
                     av_frame_free(&frame);
                 }
             }
-        } else { 
+        } else {
             /* remux this frame without reencoding */
             //            av_packet_rescale_ts(&packet,
             //                    ifmt_ctx->streams[stream_index]->time_base,
@@ -740,7 +726,7 @@ int ngx_estreaming_adaptive_bitrate(ngx_http_request_t *req, ngx_chain_t *chain,
                     , frame, &got_frame, &packet);
             if (got_frame) {
                 frame->pts = av_frame_get_best_effort_timestamp(frame);
-                ret = filter_encode_write_frame(frame, stream_index);
+                ret = filter_encode_write_frame(frame, stream_index, ifmt_ctx, ofmt_ctx, filter_ctx);
                 av_frame_free(&frame);
                 if (ret < 0) {
                     goto end;
@@ -753,7 +739,7 @@ int ngx_estreaming_adaptive_bitrate(ngx_http_request_t *req, ngx_chain_t *chain,
         /* flush filter */
         if (!filter_ctx[i].filter_graph)
             continue;
-        ret = filter_encode_write_frame(NULL, i);
+        ret = filter_encode_write_frame(NULL, i, ifmt_ctx, ofmt_ctx, filter_ctx);
         if (ret < 0) {
             av_log(NULL, AV_LOG_ERROR, "Flushing filter failed\n");
             goto end;
@@ -761,12 +747,12 @@ int ngx_estreaming_adaptive_bitrate(ngx_http_request_t *req, ngx_chain_t *chain,
         /* flush encoder */
         /* we do not encode audio frame so just flush video encoder*/
         if (ifmt_ctx->streams[i]->codec->codec_type == AVMEDIA_TYPE_VIDEO) {
-            ret = flush_decoder(i);
+            ret = flush_decoder(i, ifmt_ctx);
             if (ret < 0) {
                 av_log(NULL, AV_LOG_ERROR, "Flushing decoder failed\n");
                 goto end;
             }
-            ret = flush_encoder(i);
+            ret = flush_encoder(i, ifmt_ctx, ofmt_ctx);
             if (ret < 0) {
                 av_log(NULL, AV_LOG_ERROR, "Flushing encoder failed\n");
                 goto end;
@@ -775,42 +761,32 @@ int ngx_estreaming_adaptive_bitrate(ngx_http_request_t *req, ngx_chain_t *chain,
     }
     av_write_trailer(ofmt_ctx);
 end:
-    av_free_packet(&packet);
-    av_frame_free(&frame);
     for (i = 0; i < ifmt_ctx->nb_streams; i++) {
+        //        if (ofmt_ctx && ofmt_ctx->nb_streams > i && ofmt_ctx->streams[i] && ofmt_ctx->streams[i]->codec) {
+        avcodec_close(ofmt_ctx->streams[i]->codec);
+        //        }
         avcodec_close(ifmt_ctx->streams[i]->codec);
-        if (ofmt_ctx && ofmt_ctx->nb_streams > i && ofmt_ctx->streams[i] && ofmt_ctx->streams[i]->codec)
-            avcodec_close(ofmt_ctx->streams[i]->codec);
-        if (filter_ctx && filter_ctx[i].filter_graph)
+        if (filter_ctx && filter_ctx[i].filter_graph) {
             avfilter_graph_free(&filter_ctx[i].filter_graph);
+        }
     }
     if (filter_ctx) av_free(filter_ctx);
-    if (io_read_context->buffer) av_freep(&io_read_context->buffer);
-    if (io_read_context) av_freep(&io_read_context);
+    if (io_read_context) av_free(io_read_context);
     if (ifmt_ctx) avformat_close_input(&ifmt_ctx);
-    if (ret < 0)
-        av_log(NULL, AV_LOG_ERROR, "Error occurred: No: %d, %s\n", ret, av_err2str(ret));
+    /*
     if (chain_memory) {
         ngx_pfree(req->pool, chain_memory);
     }
     if (exchange_area_write) {
         ngx_pfree(req->pool, exchange_area_write);
     }
-    //av_freep(&ofmt_ctx->pb->buffer);
+    av_freep(&ofmt_ctx->pb->buffer);
     if (ofmt_ctx && ofmt_ctx->pb && ofmt_ctx->nb_streams > 0) av_freep(&ofmt_ctx->pb);
+    */
+    if (io_write_context) av_free(io_write_context);
     if (ofmt_ctx && ofmt_ctx->nb_streams > 0) avformat_free_context(ofmt_ctx);
-    //    if (exchange_area_read) {
-    //        av_freep(exchange_area_read);
-    //    }
+    av_free_packet(&packet);
+    av_frame_free(&frame);
+
     return ret ? 1 : 0;
 }
-
-//static ngx_str_t *ngx_http_estreaming_create_str(ngx_http_request_t *req, uint len) {
-//    ngx_str_t *aux = (ngx_str_t *) ngx_pcalloc(req->pool, sizeof(ngx_str_t) + len + 1);
-//    if (aux != NULL) {
-//        aux->data = (u_char *) (aux + 1);
-//        aux->len = len;
-//        ngx_memset(aux->data, '\0', len + 1);
-//    }
-//    return aux;
-//}
